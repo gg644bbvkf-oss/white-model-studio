@@ -75,6 +75,8 @@
   textarea{width:100%;background:var(--bg3);border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:8px;font-size:12px;resize:vertical;min-height:84px;font-family:inherit;line-height:1.6}
   textarea:focus,input:focus{outline:none;border-color:var(--acc)}
   input[type=text]{background:var(--bg3);border:1px solid var(--line);color:var(--txt);border-radius:4px;padding:5px 7px;font-size:12px;width:100%}
+  .mini{background:var(--bg3);border:1px solid var(--line);color:var(--txt2);padding:3px 9px;border-radius:10px;cursor:pointer;font-size:10px;line-height:1.4;flex-shrink:0}
+  .mini.on{background:#123a2a;border-color:var(--acc2);color:var(--acc2)}
   .joints{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px}
   .joints .row{margin:4px 0}
   .joints .row label{width:52px;font-size:11px}
@@ -150,7 +152,7 @@
         <div class="chip" id="chipFocal">35mm</div>
         <div class="chip" id="chipRes">1080×1920</div>
       </div>
-      <div id="vp-hint">左键旋转 · 右键平移 · 滚轮缩放 · W/E/R 切换工具</div>
+      <div id="vp-hint">左键旋转 · 右键平移 · 滚轮缩放 · 拖拽绿色关节节点摆姿势</div>
     </div>
 
     <aside id="rightbar">
@@ -332,6 +334,7 @@ const state = {
   shortSide: 1080,
   focalLength: 35,
   useOrtho: false,
+  jointHandlesVisible: true,
   anim: { playing:false, currentTime:0, duration:6, fps:8, keyframes:[] },
 };
 let keyAngle = -45; // 主光水平角度（度），供关键帧读写
@@ -366,6 +369,147 @@ const transformControls = new TransformControls(camera, renderer.domElement);
 transformControls.addEventListener('dragging-changed', e => controls.enabled = !e.value);
 transformControls.addEventListener('objectChange', () => { if(state.selected) updateOutline(); });
 scene.add(transformControls);
+
+/* ========================= 关节拖拽控制点 ========================= */
+// 节点绑定在关节组上、位于骨骼末端；拖动时让该骨骼朝向鼠标在视平面上的交点
+const JOINT_HANDLE_DEFS = [
+  { name:'torso',     aim: 1, len:0.78, r:0.052, label:'躯干' },
+  { name:'head',      aim: 1, len:0.20, r:0.052, label:'头' },
+  { name:'lShoulder', aim:-1, len:0.34, r:0.048, label:'左肩' },
+  { name:'lElbow',    aim:-1, len:0.32, r:0.044, label:'左肘' },
+  { name:'rShoulder', aim:-1, len:0.34, r:0.048, label:'右肩' },
+  { name:'rElbow',    aim:-1, len:0.32, r:0.044, label:'右肘' },
+  { name:'lHip',      aim:-1, len:0.46, r:0.048, label:'左髋' },
+  { name:'lKnee',     aim:-1, len:0.44, r:0.046, label:'左膝' },
+  { name:'rHip',      aim:-1, len:0.46, r:0.048, label:'右髋' },
+  { name:'rKnee',     aim:-1, len:0.44, r:0.046, label:'右膝' },
+];
+const HANDLE_IDLE = 0x5ad1a0, HANDLE_HOVER = 0x3ea0ff, HANDLE_ACTIVE = 0xff9f43;
+let jointHandles = [];
+let hoveredHandle = null;
+const handleDrag = { active:false, mesh:null, joint:null, aim:1 };
+const dragPlane = new THREE.Plane();
+const _hv = new THREE.Vector3(), _hp = new THREE.Vector3(), _hq = new THREE.Quaternion();
+
+function clearJointHandles(){
+  jointHandles.forEach(m=>{
+    if(m.parent) m.parent.remove(m);
+    m.geometry.dispose(); m.material.dispose();
+  });
+  jointHandles = [];
+  hoveredHandle = null;
+  if(!handleDrag.active) renderer.domElement.style.cursor = '';
+}
+
+function refreshJointHandles(){
+  clearJointHandles();
+  const o = state.selected;
+  if(!state.jointHandlesVisible || !o || o.type!=='character' || !o.group.visible) return;
+  const J = o.group.userData.joints || {};
+  JOINT_HANDLE_DEFS.forEach(def=>{
+    const joint = J[def.name]; if(!joint) return;
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(def.r, 14, 12),
+      new THREE.MeshBasicMaterial({ color:HANDLE_IDLE, transparent:true, opacity:0.95, depthTest:false, depthWrite:false })
+    );
+    mesh.position.set(0, def.aim*def.len, 0);
+    mesh.renderOrder = 999;
+    mesh.userData.handle = def;
+    joint.add(mesh);
+    jointHandles.push(mesh);
+  });
+}
+
+function pickJointHandle(clientX, clientY){
+  if(!state.jointHandlesVisible || !jointHandles.length) return null;
+  const rect = renderer.domElement.getBoundingClientRect();
+  if(!rect.width || !rect.height) return null;
+  pointer.x = ((clientX-rect.left)/rect.width)*2-1;
+  pointer.y = -((clientY-rect.top)/rect.height)*2+1;
+  raycaster.setFromCamera(pointer, activeCamera());
+  const hits = raycaster.intersectObjects(jointHandles, false);
+  return hits.length ? hits[0].object : null;
+}
+
+function syncJointSliders(group){
+  if(!group) return;
+  document.querySelectorAll('#selectedBody input[data-j]').forEach(inp=>{
+    const deg = Math.round(getJointRot(group, inp.dataset.j, inp.dataset.a)*180/Math.PI);
+    const mn = parseFloat(inp.min), mx = parseFloat(inp.max);
+    inp.value = Math.max(mn, Math.min(mx, deg));
+    if(inp.nextElementSibling) inp.nextElementSibling.textContent = deg + '°';
+  });
+}
+
+function onHandleDragMove(e){
+  if(!handleDrag.active || !handleDrag.joint) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((e.clientX-rect.left)/rect.width)*2-1;
+  pointer.y = -((e.clientY-rect.top)/rect.height)*2+1;
+  raycaster.setFromCamera(pointer, activeCamera());
+  if(!raycaster.ray.intersectPlane(dragPlane, _hp)) return;
+  const joint = handleDrag.joint;
+  joint.updateWorldMatrix(true, false);
+  joint.getWorldPosition(_hv);
+  const dir = _hp.clone().sub(_hv);
+  if(dir.lengthSq() < 1e-8) return;
+  dir.normalize();
+  joint.parent.getWorldQuaternion(_hq);
+  const localDir = dir.applyQuaternion(_hq.invert()).normalize();
+  joint.quaternion.setFromUnitVectors(new THREE.Vector3(0, handleDrag.aim, 0), localDir);
+  const o = state.selected;
+  if(o) o.group.userData.pose = 'custom';
+  syncJointSliders(o && o.group);
+}
+
+function onHandleDragEnd(){
+  if(!handleDrag.active) return;
+  const mesh = handleDrag.mesh;
+  handleDrag.active = false; handleDrag.mesh = null; handleDrag.joint = null;
+  if(mesh){ mesh.material.color.setHex(HANDLE_IDLE); mesh.scale.setScalar(1); }
+  controls.enabled = true;
+  renderer.domElement.style.cursor = '';
+  window.removeEventListener('pointermove', onHandleDragMove);
+  window.removeEventListener('pointerup', onHandleDragEnd);
+  if(state.selected) renderSelectedPanel();
+}
+
+// 捕获阶段拦截，优先于 OrbitControls / TransformControls
+viewport.addEventListener('pointerdown', e=>{
+  if(e.button !== 0 || !state.jointHandlesVisible) return;
+  const mesh = pickJointHandle(e.clientX, e.clientY);
+  if(!mesh) return;
+  e.preventDefault(); e.stopPropagation();
+  pausePlayback();
+  handleDrag.active = true;
+  handleDrag.mesh = mesh;
+  handleDrag.joint = mesh.parent;
+  handleDrag.aim = mesh.userData.handle.aim;
+  mesh.material.color.setHex(HANDLE_ACTIVE);
+  mesh.scale.setScalar(1.4);
+  controls.enabled = false;
+  const pivot = new THREE.Vector3(); handleDrag.joint.getWorldPosition(pivot);
+  activeCamera().getWorldDirection(_hv);
+  dragPlane.setFromNormalAndCoplanarPoint(_hv, pivot);
+  renderer.domElement.style.cursor = 'grabbing';
+  window.addEventListener('pointermove', onHandleDragMove);
+  window.addEventListener('pointerup', onHandleDragEnd);
+}, true);
+
+viewport.addEventListener('pointermove', e=>{
+  if(handleDrag.active) return;
+  const mesh = pickJointHandle(e.clientX, e.clientY);
+  if(mesh === hoveredHandle) return;
+  if(hoveredHandle){ hoveredHandle.material.color.setHex(HANDLE_IDLE); hoveredHandle.scale.setScalar(1); }
+  hoveredHandle = mesh;
+  if(hoveredHandle){ hoveredHandle.material.color.setHex(HANDLE_HOVER); hoveredHandle.scale.setScalar(1.25); renderer.domElement.style.cursor = 'grab'; }
+  else renderer.domElement.style.cursor = '';
+});
+viewport.addEventListener('pointerleave', ()=>{
+  if(handleDrag.active) return;
+  if(hoveredHandle){ hoveredHandle.material.color.setHex(HANDLE_IDLE); hoveredHandle.scale.setScalar(1); hoveredHandle = null; }
+  renderer.domElement.style.cursor = '';
+});
 
 /* ---------- 地面 & 网格 ---------- */
 const grid = new THREE.GridHelper(40, 40, 0x2a3a5c, 0x1a2438);
@@ -680,6 +824,7 @@ function selectObject(obj){
   }
   renderOutline();
   renderSelectedPanel();
+  refreshJointHandles();
 }
 
 /* 射线拾取 */
@@ -795,7 +940,11 @@ function renderSelectedPanel(){
       <div class="seg" id="weaponSeg">
         ${['none','sword','dao','spear','staff'].map(t=>`<button data-w="${t}" class="${curW===t?'on':''}">${t==='none'?'无':WEAPON_NAMES[t]}</button>`).join('')}
       </div>
-      <div style="margin:10px 0 4px;color:var(--txt2);font-size:11px">骨骼微调</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin:10px 0 2px">
+        <span style="color:var(--txt2);font-size:11px">骨骼微调</span>
+        <button class="mini ${state.jointHandlesVisible?'on':''}" id="btnJointHandles">节点拖拽 ${state.jointHandlesVisible?'开':'关'}</button>
+      </div>
+      <div style="color:var(--txt2);font-size:10px;margin:0 0 6px;line-height:1.6">可直接拖动视口中的绿色节点摆姿势，拖动时滑块会同步更新</div>
       <div class="joints">`;
     JOINT_DEFS.forEach(jd=>{
       jd.axes.forEach(([axis,label])=>{
@@ -820,6 +969,12 @@ function renderSelectedPanel(){
   if(o.type==='character'){
     body.querySelectorAll('.poseSeg button').forEach(b=> b.onclick=()=>{ pausePlayback(); applyPose(o.group, b.dataset.pose); renderSelectedPanel(); });
     body.querySelectorAll('#weaponSeg button').forEach(b=> b.onclick=()=>{ pausePlayback(); equipWeapon(o.group, b.dataset.w==='none'?null:b.dataset.w); renderSelectedPanel(); });
+    const btnJH = document.getElementById('btnJointHandles');
+    if(btnJH) btnJH.onclick = ()=>{
+      state.jointHandlesVisible = !state.jointHandlesVisible;
+      refreshJointHandles();
+      renderSelectedPanel();
+    };
     body.querySelectorAll('input[data-j]').forEach(inp=>{
       inp.oninput = ()=>{
         pausePlayback();
