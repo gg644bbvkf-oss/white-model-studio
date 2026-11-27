@@ -187,9 +187,8 @@
           </div>
           <div style="margin:10px 0 4px;color:var(--txt2);font-size:11px">导出背景</div>
           <div class="seg" id="bgSeg">
-            <button data-bg="dark" class="on">深色</button>
-            <button data-bg="black">纯黑</button>
-            <button data-bg="white">纯白</button>
+            <button data-bg="black" class="on">黑底白模</button>
+            <button data-bg="white">白底白模</button>
             <button data-bg="green">绿幕</button>
             <button data-bg="none">透明</button>
           </div>
@@ -358,7 +357,7 @@ const state = {
   useOrtho: false,
   jointHandlesVisible: true,
   cleanExport: true,
-  bgMode: 'dark',
+  bgMode: 'black',
   anim: { playing:false, currentTime:0, duration:6, fps:8, keyframes:[] },
 };
 let keyAngle = -45; // 主光水平角度（度），供关键帧读写
@@ -545,6 +544,17 @@ const ground = new THREE.Mesh(
 );
 ground.rotation.x = -Math.PI/2; ground.position.y = -0.001; ground.receiveShadow = true;
 scene.add(ground);
+
+/* 白底导出时的接影板：只显示投影，不影响背景色 */
+const shadowCatcher = new THREE.Mesh(
+  new THREE.PlaneGeometry(80,80),
+  new THREE.ShadowMaterial({ opacity:0.22 })
+);
+shadowCatcher.rotation.x = -Math.PI/2;
+shadowCatcher.position.y = -0.0008;
+shadowCatcher.receiveShadow = true;
+shadowCatcher.visible = false;
+scene.add(shadowCatcher);
 
 /* ---------- 灯光 ---------- */
 const ambient = new THREE.AmbientLight(0xffffff, 0.5);
@@ -1184,16 +1194,17 @@ function withCleanExport(fn){
     });
   }
   const oldBg = scene.background, oldFog = scene.fog;
-  if(state.bgMode !== 'dark'){
-    scene.fog = null;
-    if(state.bgMode === 'none'){ scene.background = null; renderer.setClearAlpha(0); }
-    else scene.background = new THREE.Color(CLEAN_BG[state.bgMode] ?? CLEAN_BG.dark);
-  }
+  scene.fog = null;
+  if(state.bgMode === 'none'){ scene.background = null; renderer.setClearAlpha(0); }
+  else { scene.background = new THREE.Color(CLEAN_BG[state.bgMode] ?? CLEAN_BG.black); renderer.setClearAlpha(1); }
+  const useCatcher = state.cleanExport && state.bgMode === 'white';
+  if(useCatcher) shadowCatcher.visible = true;
   try{
     return fn();
   } finally {
     scene.background = oldBg; scene.fog = oldFog;
     renderer.setClearAlpha(1);
+    if(useCatcher) shadowCatcher.visible = false;
     emissive.forEach(([mat,hex])=>mat.emissive.setHex(hex));
     vis.forEach(([o,v])=>o.visible = v);
   }
