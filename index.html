@@ -77,6 +77,7 @@
   input[type=text]{background:var(--bg3);border:1px solid var(--line);color:var(--txt);border-radius:4px;padding:5px 7px;font-size:12px;width:100%}
   .mini{background:var(--bg3);border:1px solid var(--line);color:var(--txt2);padding:3px 9px;border-radius:10px;cursor:pointer;font-size:10px;line-height:1.4;flex-shrink:0}
   .mini.on{background:#123a2a;border-color:var(--acc2);color:var(--acc2)}
+  select.sel{flex:1;background:var(--bg3);border:1px solid var(--line);color:var(--txt);border-radius:4px;padding:5px 6px;font-size:11px;outline:none}
   .joints{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px}
   .joints .row{margin:4px 0}
   .joints .row label{width:52px;font-size:11px}
@@ -184,6 +185,17 @@
             <button data-r="1080" class="on">1080</button>
             <button data-r="1440">1440</button>
           </div>
+          <div style="margin:10px 0 4px;color:var(--txt2);font-size:11px">导出背景</div>
+          <div class="seg" id="bgSeg">
+            <button data-bg="dark" class="on">深色</button>
+            <button data-bg="black">纯黑</button>
+            <button data-bg="white">纯白</button>
+            <button data-bg="green">绿幕</button>
+            <button data-bg="none">透明</button>
+          </div>
+          <div style="margin:10px 0 4px;color:var(--txt2);font-size:11px">纯净导出</div>
+          <div class="seg"><button id="btnClean" class="on" style="flex:none;min-width:0">隐藏网格 / 地面 / 名牌 / 关节节点 / 选中高亮</button></div>
+          <div style="color:var(--txt2);font-size:10px;margin:4px 0 0;line-height:1.5">仅作用于导出图（参考图 / 序列帧 / 分镜拼图），不影响视口显示</div>
           <div class="row" style="margin-top:10px"><label>投影</label>
             <div class="seg" style="flex:1">
               <button id="camPersp" class="on">透视</button>
@@ -299,6 +311,16 @@
             <button class="bigbtn primary" id="btnExportFrames" style="margin:0;flex:1">导出序列帧</button>
             <button class="bigbtn ok" id="btnExportSheet" style="margin:0;flex:1">分镜拼图</button>
           </div>
+          <div style="margin:12px 0 2px;color:var(--txt2);font-size:11px">H3 首尾帧对</div>
+          <div class="row" style="margin:6px 0">
+            <label style="width:34px">首帧</label>
+            <select class="sel" id="pairFirst"></select>
+          </div>
+          <div class="row" style="margin:6px 0">
+            <label style="width:34px">尾帧</label>
+            <select class="sel" id="pairLast"></select>
+          </div>
+          <button class="bigbtn primary" id="btnExportPair" style="margin-top:2px">导出首尾帧对（first / last）</button>
         </div>
       </div>
     </aside>
@@ -335,6 +357,8 @@ const state = {
   focalLength: 35,
   useOrtho: false,
   jointHandlesVisible: true,
+  cleanExport: true,
+  bgMode: 'dark',
   anim: { playing:false, currentTime:0, duration:6, fps:8, keyframes:[] },
 };
 let keyAngle = -45; // 主光水平角度（度），供关键帧读写
@@ -351,7 +375,7 @@ camera.position.set(4, 3.2, 6);
 const ortho = new THREE.OrthographicCamera(-5,5,5,-5,0.1,500);
 ortho.position.copy(camera.position);
 
-const renderer = new THREE.WebGLRenderer({ antialias:true, preserveDrawingBuffer:true });
+const renderer = new THREE.WebGLRenderer({ antialias:true, preserveDrawingBuffer:true, alpha:true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -1141,6 +1165,40 @@ document.getElementById('btnCopy').onclick = async ()=>{
   try{ await navigator.clipboard.writeText(t); toast('描述词已复制'); }catch{ toast('复制失败，请手动选择'); }
 };
 
+const CLEAN_BG = { dark:0x0a0e16, black:0x000000, white:0xffffff, green:0x00b140 };
+
+/* 纯净导出：临时隐藏辅助物、替换背景，渲染完自动恢复（不影响视口） */
+function withCleanExport(fn){
+  const vis = [];
+  const emissive = [];
+  if(state.cleanExport){
+    const hideObj = o=>{ if(o){ vis.push([o,o.visible]); o.visible = false; } };
+    hideObj(grid); hideObj(ground); hideObj(transformControls);
+    jointHandles.forEach(hideObj);
+    state.objects.forEach(o=>{ if(o.label) hideObj(o.label); });
+    scene.traverse(m=>{
+      if(m.isMesh && m.userData._origEmissive!==undefined && m.material && m.material.emissive){
+        emissive.push([m.material, m.material.emissive.getHex()]);
+        m.material.emissive.setHex(m.userData._origEmissive);
+      }
+    });
+  }
+  const oldBg = scene.background, oldFog = scene.fog;
+  if(state.bgMode !== 'dark'){
+    scene.fog = null;
+    if(state.bgMode === 'none'){ scene.background = null; renderer.setClearAlpha(0); }
+    else scene.background = new THREE.Color(CLEAN_BG[state.bgMode] ?? CLEAN_BG.dark);
+  }
+  try{
+    return fn();
+  } finally {
+    scene.background = oldBg; scene.fog = oldFog;
+    renderer.setClearAlpha(1);
+    emissive.forEach(([mat,hex])=>mat.emissive.setHex(hex));
+    vis.forEach(([o,v])=>o.visible = v);
+  }
+}
+
 function renderFramePNG(){
   const a = state.targetAspect;
   let w,h;
@@ -1150,8 +1208,10 @@ function renderFramePNG(){
   renderer.setPixelRatio(1);
   renderer.setSize(w,h,false);
   if(cam.isPerspectiveCamera){ cam.aspect=a; cam.updateProjectionMatrix(); }
-  renderer.render(scene, cam);
-  const url = renderer.domElement.toDataURL('image/png');
+  const url = withCleanExport(()=>{
+    renderer.render(scene, cam);
+    return renderer.domElement.toDataURL('image/png');
+  });
   renderer.setPixelRatio(oldPr);
   resizeViewport();
   return { url, w, h };
@@ -1165,6 +1225,24 @@ function exportImage(){
 }
 document.getElementById('btnExport').onclick = exportImage;
 document.getElementById('btnExport2').onclick = exportImage;
+
+/* 导出背景 & 纯净导出开关（仅影响导出图） */
+document.querySelectorAll('#bgSeg button').forEach(b=>{
+  b.onclick = ()=>{
+    document.querySelectorAll('#bgSeg button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on');
+    state.bgMode = b.dataset.bg;
+  };
+});
+document.getElementById('btnClean').onclick = e=>{
+  state.cleanExport = !state.cleanExport;
+  e.currentTarget.classList.toggle('on', state.cleanExport);
+};
+
+function downloadURL(url, name){
+  const link = document.createElement('a');
+  link.download = name; link.href = url; link.click();
+}
 
 /* ========================= 关键帧动画 / 时间轴 ========================= */
 const lerp = (a,b,t)=>a+(b-a)*t;
@@ -1361,6 +1439,7 @@ function renderTimeline(){
   });
   tickTimeline();
   document.getElementById('tlKfCount').textContent = `${state.anim.keyframes.length} 帧`;
+  fillPairSelects();
 }
 /* 播放中仅更新播放头与时间标签，不重建关键帧 DOM */
 function tickTimeline(){
@@ -1486,6 +1565,42 @@ async function exportSequence(){
 }
 document.getElementById('btnExportSheet').onclick = exportSheet;
 document.getElementById('btnExportFrames').onclick = exportSequence;
+
+/* 导出 H3 首尾帧对 */
+function fmtPairTime(t){ return t.toFixed(2).replace('.', '_'); }
+async function exportFramePair(){
+  const kfs = state.anim.keyframes;
+  if(kfs.length < 2){ toast('至少需要 2 个关键帧'); return; }
+  const i1 = +document.getElementById('pairFirst').value;
+  const i2 = +document.getElementById('pairLast').value;
+  if(!(i1 >= 0) || !(i2 >= 0) || i1 === i2){ toast('首帧和尾帧不能相同'); return; }
+  const prevT = state.anim.currentTime, wasPlaying = state.anim.playing;
+  state.anim.playing = false;
+  const btn = document.getElementById('btnExportPair'); btn.disabled = true;
+  seekTo(kfs[i1].time); const f1 = renderFramePNG();
+  seekTo(kfs[i2].time); const f2 = renderFramePNG();
+  seekTo(prevT);
+  state.anim.playing = wasPlaying;
+  const stamp = Date.now();
+  downloadURL(f1.url, `H3_first_${fmtPairTime(kfs[i1].time)}s_${f1.w}x${f1.h}_${stamp}.png`);
+  await new Promise(r=>setTimeout(r, 400));
+  downloadURL(f2.url, `H3_last_${fmtPairTime(kfs[i2].time)}s_${f2.w}x${f2.h}_${stamp}.png`);
+  btn.disabled = false;
+  toast(`已导出首尾帧对（${f1.w}×${f1.h}）`);
+}
+document.getElementById('btnExportPair').onclick = exportFramePair;
+
+/* 首尾帧下拉框跟随关键帧更新 */
+function fillPairSelects(){
+  const s1 = document.getElementById('pairFirst'), s2 = document.getElementById('pairLast');
+  if(!s1 || !s2) return;
+  const kfs = state.anim.keyframes;
+  const p1 = s1.value, p2 = s2.value;
+  const opts = kfs.map((kf,i)=>`<option value="${i}">${String(i+1).padStart(2,'0')} · ${kf.time.toFixed(2)}s</option>`).join('');
+  s1.innerHTML = opts; s2.innerHTML = opts;
+  s1.value = kfs.length ? (p1 !== '' && +p1 < kfs.length ? p1 : '0') : '';
+  s2.value = kfs.length ? (p2 !== '' && +p2 < kfs.length ? p2 : String(kfs.length-1)) : '';
+}
 
 /* ========================= AI 动作捕捉（MediaPipe Pose，浏览器端） ========================= */
 const POSE_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404';
